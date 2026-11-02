@@ -1,0 +1,156 @@
+name: Manual EDL package
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Run ID of a successful Manual OCI build"
+        required: true
+        type: string
+      source_ref:
+        description: "Full upstream commit SHA used by that OCI build"
+        required: true
+        default: "9788014a0293dc26745b000d02854ad88ef73e88"
+        type: string
+      model:
+        description: "Device profile to package"
+        required: true
+        default: "TB322FC"
+        type: string
+      root_image_gib:
+        description: "Seed root image size (32 or 48 GiB)"
+        required: true
+        default: "32"
+        type: choice
+        options:
+          - "32"
+          - "48"
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  build:
+    name: Build and upload EDL package
+    runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: edl-package-${{ inputs.build_run_id }}-${{ inputs.model }}
+      cancel-in-progress: false
+      queue: max
+
+    steps:
+      - name: Free build space
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
+        with:
+          remove-codeql: true
+
+      - name: Check out exact upstream source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mydanyi/armadaos-freedom
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+
+      - name: Require Docker host and loop devices
+        run: |
+          set -euo pipefail
+          docker version >/dev/null
+          test -c /dev/loop-control
+          available=0
+          for index in $(seq 0 255); do
+            [ -b "/dev/loop${index}" ] || continue
+            [ -e "/sys/block/loop${index}/loop/backing_file" ] && continue
+            [ "$(cat "/sys/block/loop${index}/size" 2>/dev/null || printf 1)" = 0 ] || continue
+            available=$((available + 1))
+            [ "${available}" -ge 2 ] && break
+          done
+          [ "${available}" -ge 2 ]
+          grep -qw btrfs /proc/filesystems
+
+      - name: Download OCI artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/oci-artifact"
+          mkdir -p "${dest}"
+          gh run download "${BUILD_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "armada-container-manual-${BUILD_RUN_ID}" \
+            --dir "${dest}"
+          find "${dest}" -name 'armada-manual-*.tar' -print -quit
+          [ -n "$(find "${dest}" -name 'armada-manual-*.tar' -print -quit)" ]
+
+      - name: Import OCI archive as a local layout
+        id: image
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          archive="$(find "${RUNNER_TEMP}/oci-artifact" -name 'armada-manual-*.tar' -print -quit)"
+          layout="${RUNNER_TEMP}/oci-layout"
+          rm -rf "${layout}"
+          skopeo copy "oci-archive:${archive}:latest" "oci:${layout}:latest"
+          digest="$(skopeo inspect --format '{{.Digest}}' "oci:${layout}:latest")"
+          config="$(skopeo inspect --config "oci:${layout}:latest")"
+          revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' <<<"${config}")"
+          version="$(jq -r '.config.Labels["org.opencontainers.image.version"] // empty' <<<"${config}")"
+          jq -e --arg revision "${SOURCE_REF}" --arg version "${version}" '
+            .architecture == "arm64" and
+            .os == "linux" and
+            .config.Labels["org.opencontainers.image.revision"] == $revision and
+            ($version | length > 0) and
+            $version != "latest"
+          ' <<<"${config}"
+          echo "layout=${layout}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "### OCI input" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- digest: \`${digest}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- version: \`${version}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Build official EDL package
+        env:
+          OCI_LAYOUT: ${{ steps.image.outputs.layout }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          REVISION: ${{ inputs.source_ref }}
+          VERSION: ${{ steps.image.outputs.version }}
+          MODEL: ${{ inputs.model }}
+          ROOT_IMAGE_GIB: ${{ inputs.root_image_gib }}
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/edl-work"
+          output="${GITHUB_WORKSPACE}/output/edl/${VERSION}"
+          rm -rf "${work}" "${output}"
+          boot_uuid="$(cat /proc/sys/kernel/random/uuid)"
+          root_uuid="$(cat /proc/sys/kernel/random/uuid)"
+          bash "${GITHUB_WORKSPACE}/build_files/build-edl-package.sh" \
+            --oci "${OCI_LAYOUT}" \
+            --manifest-digest "${IMAGE_DIGEST}" \
+            --source-commit "${REVISION}" \
+            --version "${VERSION}" \
+            --origin "ostree-image-signed:docker://ghcr.io/mydanyi/armadaos-freedom:testing" \
+            --source "${GITHUB_WORKSPACE}" \
+            --devices-config "${GITHUB_WORKSPACE}/build_files/edl-devices.json" \
+            --model "${MODEL}" \
+            --root-image-gib "${ROOT_IMAGE_GIB}" \
+            --boot-uuid "${boot_uuid}" \
+            --root-uuid "${root_uuid}" \
+            --work "${work}" \
+            --output "${output}"
+
+      - name: Upload EDL package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: edl-package-${{ inputs.model }}-${{ github.run_id }}
+          path: |
+            output/edl/**/*.zip.[0-9][0-9][0-9]*
+            output/edl/**/*.parts.json
+            output/edl/**/SHA256SUMS
+            output/edl/**/README*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

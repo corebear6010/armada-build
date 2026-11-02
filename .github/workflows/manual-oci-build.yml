@@ -52,6 +52,11 @@ jobs:
       - name: Install skopeo
         run: command -v skopeo >/dev/null || { sudo apt-get update && sudo apt-get install -y skopeo; }
 
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Test the package ref resolver
         run: bash tests/package-ref-test.sh
 
@@ -71,7 +76,15 @@ jobs:
             var="$(printf '%s' "${pkg}" | tr '[:lower:]-' '[:upper:]_')_REF"
 
             status=0
-            actual="$(bash packages/resolve-package-ref.sh "${pkg}" "${hash}" "${FREEDOM_PKG}" "${UPSTREAM_PKG}")" || status=$?
+            for attempt in 1 2 3 4 5; do
+              status=0
+              actual="$(bash packages/resolve-package-ref.sh "${pkg}" "${hash}" "${FREEDOM_PKG}" "${UPSTREAM_PKG}")" || status=$?
+              if [ "${status}" -ne 1 ]; then
+                break
+              fi
+              echo "::warning::registry lookup for ${pkg}:${hash} failed transiently (attempt ${attempt}/5)"
+              sleep 5
+            done
             if [ "${status}" -eq 0 ]; then
               echo "::notice::${pkg} already published for this content hash (${hash}): ${actual}"
               refs="${refs}${var}=${actual}"$'\n'
@@ -149,6 +162,11 @@ jobs:
           mkdir -p ~/.config/containers
           printf '[engine]\nruntime = "runc"\n' > ~/.config/containers/containers.conf
 
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | buildah login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Resolve builder images
         run: |
           set -euo pipefail
@@ -218,6 +236,11 @@ jobs:
 
       - name: Prepare environment
         run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "${GITHUB_ENV}"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | buildah login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
