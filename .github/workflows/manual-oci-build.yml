@@ -214,13 +214,92 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  native:
+    name: ${{ matrix.package }} (arm64)
+    needs: resolve
+    if: needs.resolve.outputs.native != '[]'
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.native) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mydanyi/armadaos-freedom
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+
+      - name: Install container tools
+        run: |
+          set -euxo pipefail
+          need=""
+          for t in buildah; do
+            command -v "$t" >/dev/null || need="$need $t"
+          done
+          command -v runc >/dev/null || need="$need runc"
+          [ -z "$need" ] || { sudo apt-get update && sudo apt-get install -y $need; }
+          mkdir -p ~/.config/containers
+          printf '[engine]\nruntime = "runc"\n' > ~/.config/containers/containers.conf
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | buildah login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Resolve builder images
+        run: |
+          set -euo pipefail
+          source packages/toolchain.env
+          source packages/mesa-x86/BASE.env
+          echo "BUILDER_IMAGE=${BUILDER_IMAGE}" >> "${GITHUB_ENV}"
+          echo "GUEST_BUILDER_IMAGE=${GUEST_BUILDER_IMAGE}" >> "${GITHUB_ENV}"
+
+      - name: Build package
+        env:
+          PACKAGE: ${{ matrix.package }}
+          HASH: ${{ matrix.hash }}
+        run: |
+          set -euxo pipefail
+          buildah build \
+            -f packages/Containerfile \
+            --target "out-${PACKAGE}" \
+            --layers \
+            --cache-from "${FREEDOM_CACHE}/${PACKAGE}" \
+            --cache-from "${UPSTREAM_CACHE}/${PACKAGE}" \
+            --build-arg "BUILDER_IMAGE=${BUILDER_IMAGE}" \
+            --build-arg "GUEST_BUILDER_IMAGE=${GUEST_BUILDER_IMAGE}" \
+            -t "localhost/armada/pkg/${PACKAGE}:${HASH}" \
+            packages/
+
+      - name: Export for the image build
+        env:
+          PACKAGE: ${{ matrix.package }}
+          HASH: ${{ matrix.hash }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "${RUNNER_TEMP}/export"
+          buildah push \
+            "localhost/armada/pkg/${PACKAGE}:${HASH}" \
+            "oci-archive:${RUNNER_TEMP}/export/${PACKAGE}.tar"
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pkg-${{ matrix.package }}
+          path: ${{ runner.temp }}/export/${{ matrix.package }}.tar
+          retention-days: 1
+          if-no-files-found: error
+
   image:
     name: Container image
-    needs: [resolve, cross]
+    needs: [resolve, cross, native]
     if: >-
       !cancelled() &&
       needs.resolve.result == 'success' &&
-      (needs.cross.result == 'success' || needs.cross.result == 'skipped')
+      (needs.cross.result == 'success' || needs.cross.result == 'skipped') &&
+      (needs.native.result == 'success' || needs.native.result == 'skipped')
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -286,10 +365,12 @@ jobs:
           buildah info --storage-opt=overlay.mount_program= |
             jq -e '.store.GraphStatus["Native Overlay Diff"] == "true"'
 
-      - name: Load cross-built packages
-        if: needs.cross.result == 'success'
+      - name: Load built packages
+        if: needs.cross.result == 'success' || needs.native.result == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CROSS_PACKAGES: ${{ needs.resolve.outputs.cross }}
+          NATIVE_PACKAGES: ${{ needs.resolve.outputs.native }}
         run: |
           set -euxo pipefail
           # gh instead of download-artifact: this repo pins every action, and
@@ -297,34 +378,14 @@ jobs:
           dir="${RUNNER_TEMP}/imported"
           mkdir -p "${dir}"
           gh run download "${GITHUB_RUN_ID}" --pattern 'pkg-*' --dir "${dir}"
+          packages="$(jq -s 'add' <<< "${CROSS_PACKAGES}"$'\n'"${NATIVE_PACKAGES}")"
           while read -r pkg hash; do
             # gh lays artifacts out differently for one vs many, so find the tar.
             tar="$(find "${dir}" -name "${pkg}.tar" -print -quit)"
             [ -n "${tar}" ] || { echo "::error::${pkg}.tar missing from artifacts"; exit 1; }
             id="$(buildah pull "oci-archive:${tar}")"
             buildah tag "${id}" "localhost/armada/pkg/${pkg}:${hash}"
-          done < <(jq -r '.[] | "\(.package) \(.hash)"' <<<'${{ needs.resolve.outputs.cross }}')
-
-      - name: Build the remaining packages
-        if: needs.resolve.outputs.native != '[]'
-        run: |
-          set -euxo pipefail
-          source packages/toolchain.env
-          source packages/mesa-x86/BASE.env
-          while read -r pkg hash; do
-            echo "::group::${pkg}"
-            buildah build \
-              -f packages/Containerfile \
-              --target "out-${pkg}" \
-              --layers \
-              --cache-from "${FREEDOM_CACHE}/${pkg}" \
-              --cache-from "${UPSTREAM_CACHE}/${pkg}" \
-              --build-arg "BUILDER_IMAGE=${BUILDER_IMAGE}" \
-              --build-arg "GUEST_BUILDER_IMAGE=${GUEST_BUILDER_IMAGE}" \
-              -t "localhost/armada/pkg/${pkg}:${hash}" \
-              packages/
-            echo "::endgroup::"
-          done < <(jq -r '.[] | "\(.package) \(.hash)"' <<<'${{ needs.resolve.outputs.native }}')
+          done < <(jq -r '.[] | "\(.package) \(.hash)"' <<<"${packages}")
 
       - name: Write package refs
         run: |
