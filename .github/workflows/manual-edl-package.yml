@@ -93,7 +93,7 @@ jobs:
           archive="$(find "${RUNNER_TEMP}/oci-artifact" -name 'armada-manual-*.tar' -print -quit)"
           layout="${RUNNER_TEMP}/oci-layout"
           rm -rf "${layout}"
-          skopeo copy "oci-archive:${archive}:latest" "oci:${layout}:latest"
+          skopeo copy "oci-archive:${archive}" "oci:${layout}:latest"
           digest="$(skopeo inspect --format '{{.Digest}}' "oci:${layout}:latest")"
           config="$(skopeo inspect --config "oci:${layout}:latest")"
           revision="$(jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' <<<"${config}")"
