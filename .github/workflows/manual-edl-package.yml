@@ -142,6 +142,79 @@ jobs:
             --work "${work}" \
             --output "${output}"
 
+      - name: Validate device selection and payloads
+        env:
+          VERSION: ${{ steps.image.outputs.version }}
+          MODEL: ${{ inputs.model }}
+          REVISION: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/edl-work/archive/ArmadaOS-Freedom-${VERSION}.zip"
+          python3 - "${archive}" "${MODEL}" "${REVISION}" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          archive_path, model, revision = sys.argv[1:]
+          expected_model_root = f"models/{model}/"
+          with zipfile.ZipFile(archive_path) as archive:
+              names = set(archive.namelist())
+              bundle = json.loads(archive.read("bundle.json"))
+              packages = bundle.get("packages")
+              if not isinstance(packages, list) or len(packages) != 1:
+                  raise SystemExit("bundle.json must contain exactly one package")
+              if packages[0].get("deviceModel") != model:
+                  raise SystemExit("bundle model does not match the requested model")
+
+              required = {
+                  "common/boot/kernel.img",
+                  "common/boot/initramfs.img",
+                  "common/images/linux-boot.ext4.gz",
+                  "common/images/linux-root.btrfs.gz",
+                  f"{expected_model_root}package.json",
+                  f"{expected_model_root}runtime/runtime.bin",
+                  f"{expected_model_root}boot/dtb-normal.img",
+                  f"{expected_model_root}boot/dtb-diagnostic.img",
+              }
+              missing = sorted(required - names)
+              if missing:
+                  raise SystemExit(f"missing package entries: {missing}")
+              foreign_models = sorted(
+                  name for name in names
+                  if name.startswith("models/") and not name.startswith(expected_model_root)
+              )
+              if foreign_models:
+                  raise SystemExit(f"package contains unrequested model files: {foreign_models[:5]}")
+              if archive.getinfo(f"{expected_model_root}runtime/runtime.bin").file_size != 4 * 1024 * 1024:
+                  raise SystemExit("runtime is not exactly 4 MiB")
+
+              manifest = json.loads(archive.read(f"{expected_model_root}package.json"))
+              if manifest.get("deviceModel") != model:
+                  raise SystemExit("model manifest device does not match")
+              if manifest.get("sourceCommit") != revision:
+                  raise SystemExit("model manifest source commit does not match")
+              if model == "TB322FC":
+                  if manifest.get("compatible") != {"soc": "SM8750", "device": "elden"}:
+                      raise SystemExit("unexpected TB322FC compatibility tuple")
+                  boot = manifest.get("bootCompatibility", {})
+                  if boot.get("partitionBytes") != 100663296:
+                      raise SystemExit("unexpected Android boot partition budget")
+                  args = manifest.get("bootRecipe", {}).get("normalBootArgs", "")
+                  for forbidden_arg in (
+                      "baldur.end=hold",
+                      "cpuidle_psci_domain.allow_cluster_off=0",
+                      "msm.dpu_use_virtual_planes=0",
+                  ):
+                      if forbidden_arg in args:
+                          raise SystemExit(f"TB322FC boot args contain Baldur argument: {forbidden_arg}")
+                  diagnostic = manifest.get("bootRecipe", {}).get("diagnosticBootArgs", "")
+                  if not diagnostic.endswith("rd.break=pre-mount"):
+                      raise SystemExit("TB322FC diagnostic boot args do not end in rd.break=pre-mount")
+
+          print(f"validated {archive_path}: only {model}, 4 MiB runtime, expected boot budget and args")
+          PY
+          (cd "${GITHUB_WORKSPACE}/output/edl/${VERSION}" && sha256sum -c SHA256SUMS)
+
       - name: Upload EDL package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
