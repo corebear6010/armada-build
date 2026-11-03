@@ -57,6 +57,16 @@ jobs:
         run: |
           set -euo pipefail
           docker version >/dev/null
+          sudo modprobe loop || true
+          sudo modprobe btrfs || true
+          if [ ! -c /dev/loop-control ]; then
+            sudo mknod -m 0600 /dev/loop-control c 10 237
+          fi
+          for index in $(seq 0 7); do
+            if [ ! -b "/dev/loop${index}" ]; then
+              sudo mknod -m 0660 "/dev/loop${index}" b 7 "${index}"
+            fi
+          done
           test -c /dev/loop-control
           available=0
           for index in $(seq 0 255); do
@@ -66,6 +76,9 @@ jobs:
             available=$((available + 1))
             [ "${available}" -ge 2 ] && break
           done
+          echo "available free loop devices: ${available}"
+          ls -l /dev/loop-control /dev/loop[0-7]
+          grep -w btrfs /proc/filesystems
           [ "${available}" -ge 2 ]
           grep -qw btrfs /proc/filesystems
 
